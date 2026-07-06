@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supply-graph-ai"
-version = "0.8.6"
+version = "0.8.7"
 description = "Open Hardware Manager (OHM) - A flexible, domain-agnostic framework for matching requirements with capabilities"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,6 +28,7 @@ dependencies = [
     "python-multipart>=0.0.31",
     # Data modeling
     "pydantic[email]>=2.0.0,<3.0.0",
+    "pydantic-settings>=2.2.0,<3.0.0",
     # Graph
     "networkx",
     # Storage / cloud

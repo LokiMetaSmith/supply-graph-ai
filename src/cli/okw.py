@@ -498,6 +498,118 @@ async def list_facilities(
         raise
 
 
+@okw_group.command(name="spaces")
+@click.option("--no-mom", is_flag=True, help="Exclude Maps of Making; local only.")
+@click.option("--refresh", is_flag=True, help="Force a MoM cache refresh first.")
+@click.option("--country", help="Filter by country.")
+@click.option("--city", help="Filter by city (substring).")
+@click.option(
+    "--process", help="Filter by canonical OHM process id (e.g. laser_cutting)."
+)
+@click.option("--source", type=click.Choice(["local", "mom"]), help="Filter by source.")
+@click.option("--status", help="Filter by status (active/tentative/inactive).")
+@click.option("--region", help="Filter by region/state (local-only, soft).")
+@click.option("--access-type", help="Filter by access type (local-only, soft).")
+@standard_cli_command(
+    help_text="""
+    List the unified network surface: local OKW facilities ∪ Maps of Making,
+    server-filtered. Each space is source-labeled. Cross-source filters
+    (country/city/process/source/status) hard-exclude; local-only filters
+    (region/access-type) soft-filter — spaces that can't express them are kept,
+    flagged ambiguous, and sorted last. MoM comes from a 24h cache and degrades
+    gracefully.
+    """,
+    epilog="""
+    Examples:
+      ohm okw spaces                          # everything
+      ohm okw spaces --country FR --process laser_cutting
+      ohm okw spaces --no-mom --access-type Public
+    """,
+    async_cmd=True,
+    track_performance=True,
+    handle_errors=True,
+    format_output=True,
+    add_llm_config=False,
+)
+@click.pass_context
+async def okw_spaces(
+    ctx,
+    no_mom: bool,
+    refresh: bool,
+    country: Optional[str],
+    city: Optional[str],
+    process: Optional[str],
+    source: Optional[str],
+    status: Optional[str],
+    region: Optional[str],
+    access_type: Optional[str],
+    verbose: bool,
+    output_format: str,
+    use_llm: bool,
+    llm_provider: str,
+    llm_model: Optional[str],
+    quality_level: str,
+    strict_mode: bool,
+):
+    """List the unified network surface (local OKW ∪ Maps of Making)."""
+    cli_ctx = ctx.obj
+    cli_ctx.start_command_tracking("okw-spaces")
+    include_mom = not no_mom
+    filters = {
+        "country": country,
+        "city": city,
+        "process": process,
+        "source": source,
+        "status": status,
+        "region": region,
+        "access_type": access_type,
+    }
+
+    try:
+
+        async def http_spaces():
+            cli_ctx.log("Fetching network spaces via HTTP API...", "info")
+            params = {
+                "include_mom": str(include_mom).lower(),
+                "force_refresh": str(refresh).lower(),
+                **{k: v for k, v in filters.items() if v is not None},
+            }
+            return await cli_ctx.api_client.request(
+                "GET", "/api/okw/spaces", params=params
+            )
+
+        async def fallback_spaces():
+            cli_ctx.log("Building network spaces via direct service...", "info")
+            okw_service = await OKWService.get_instance()
+            return await okw_service.get_network_spaces(
+                include_mom=include_mom, force_refresh=refresh, **filters
+            )
+
+        command = SmartCommand(cli_ctx)
+        result = await command.execute_with_fallback(http_spaces, fallback_spaces)
+        data = result.get("data", result) if isinstance(result, dict) else result
+
+        if output_format == "json":
+            click.echo(json.dumps(data, indent=2))
+        else:
+            mom_state = "available" if data.get("mom_available") else "unavailable"
+            click.echo(
+                f"🗺️  {data.get('total', 0)} spaces "
+                f"({data.get('local_count', 0)} local + {data.get('mom_count', 0)} MoM)"
+            )
+            dropped = data.get("dropped_no_coords", 0)
+            if dropped:
+                click.echo(f"   {dropped} local facility(ies) omitted (no coordinates)")
+            if include_mom:
+                click.echo(f"   Maps of Making: {mom_state}")
+
+        cli_ctx.end_command_tracking()
+
+    except Exception as e:
+        cli_ctx.log(f"Network spaces build failed: {str(e)}", "error")
+        raise
+
+
 @okw_group.command()
 @click.argument("facility_id", type=str)
 @click.option("--force", is_flag=True, help="Force deletion without confirmation")

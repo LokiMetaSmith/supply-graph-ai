@@ -131,16 +131,32 @@ class What3Words:
     language: str  # ISO 639-2 or ISO 639-3 language code
 
 @dataclass
+class Coordinates:
+    """Geographic coordinates parsed from the OKW decimal-degrees string."""
+    latitude: float
+    longitude: float
+    # to_dict() → {"lat": latitude, "lon": longitude}
+
+@dataclass
 class Location:
     """Location information with multiple addressing options"""
     address: Optional[Address] = None
-    gps_coordinates: Optional[str] = None  # Decimal degrees
+    gps_coordinates: Optional[str] = None  # Decimal degrees (spec: single string)
     directions: Optional[str] = None
     what3words: Optional[What3Words] = None
     city: Optional[str] = None
     country: Optional[str] = None
-    # to_dict() → delegates to Address.to_dict() and What3Words
+    # coordinates() → Optional[Coordinates]; the single typed accessor for the
+    #   decimal-degrees gps_coordinates string (None if absent/malformed/out-of-range).
+    # to_dict() → delegates to Address.to_dict() and What3Words, and additionally
+    #   emits a structured "coordinates": {"lat", "lon"} when gps_coordinates parses,
+    #   so consumers (e.g. the web map) get numeric lat/lon without re-parsing.
 ```
+
+The `gps_coordinates` string is the spec-compliant stored form (OKW standard §6.3,
+Decimal Degrees). `parse_decimal_degrees(value)` is the module-level helper behind
+`Location.coordinates()`; the MoM/SpaceAPI serialization (`to_spaceapi_json`) uses the
+same accessor so coordinate parsing lives in exactly one place.
 
 ### 4. Agent
 Person or organization associated with a facility.
@@ -565,6 +581,31 @@ if facility.has_process("3d printing"):
 The check searches both `manufacturing_processes` URLs and equipment capability
 descriptions.
 
+## Network surface & Maps of Making
+
+`GET /api/okw/spaces` (and `ohm okw spaces`) return the unified, server-filtered
+network surface for the web UI's map + list views: **local OKW facilities unioned
+with [Maps of Making](https://mapsofmaking.org) (MoM) spaces**. Each space is
+source-labeled and projected to a common shape —
+`{id, name, lat, lon, city, region, country, source, status, processes, url}` with
+`source` in `{"local", "mom"}` — so the surface is source-agnostic and grows to
+further networks.
+
+- **Coordinates** come from `Location.coordinates()`. Local facilities without
+  parseable coordinates are counted in `dropped_no_coords` rather than plotted.
+- **Server-side filters:** cross-source (hard) `country`, `city`, `process`
+  (canonical OHM process id), `source`, `status`; local-only (soft) `region`,
+  `access_type` — spaces that can't express a local-only axis (e.g. MoM) are
+  **kept, flagged `ambiguous`, and sorted last** rather than excluded.
+- **MoM** is fetched from a **24h TTL cache** (`MoMSpacesCache` in
+  `services/mom_bridge.py`) and enriched with city (`addressLocality`), country
+  (`countryCode`), status (`operationalState`), url, and processes (`knowsAbout`
+  slugs normalized to canonical OHM process ids via the taxonomy). It **degrades
+  gracefully**: if MoM is unreachable the response is local-only with
+  `mom_available: false`, and a stale cache keeps serving until a refresh
+  succeeds. `mom_spaces_cache.refresh()` / `.invalidate()` are the cache-refresh
+  hooks; the endpoint's `force_refresh=true` (and CLI `--refresh`) trigger one.
+
 ## CLI Commands
 
 | Command | Description |
@@ -577,6 +618,7 @@ descriptions.
 | `ohm okw export` | Export the OKW JSON Schema |
 | `ohm okw template` | Output a blank facility template |
 | `ohm okw create-interactive` | Interactively build a new facility |
+| `ohm okw spaces` | Unified network surface: local ∪ Maps of Making, server-filtered (`--country`, `--city`, `--process`, `--source`, `--status`, `--region`, `--access-type`, `--no-mom`, `--refresh`) |
 
 ## API Endpoints
 
@@ -584,6 +626,7 @@ descriptions.
 |---|---|---|
 | `GET` | `/api/okw/export` | Export OKW JSON Schema |
 | `GET` | `/api/okw/template` | Get blank facility template |
+| `GET` | `/api/okw/spaces` | Unified network surface (local OKW ∪ Maps of Making), server-filtered by `country`/`city`/`process`/`source`/`status`/`region`/`access_type` (+ `include_mom`, `force_refresh`) |
 | `POST` | `/api/okw/create` | Create facility from JSON body |
 | `POST` | `/api/okw/validate` | Validate a facility dict |
 | `POST` | `/api/okw/upload` | Upload a facility file |

@@ -34,7 +34,8 @@ export function App() {
               <Route path="facilities" element={<OkwPage />} />
               <Route path="facilities/:id" element={<OkwPage />} />
               <Route path="match" element={<MatchPage />} />
-              <Route path="visualization" element={<VisualizationPage />} />
+              {/* Supply trees are reached directly from their match; no browse list. */}
+              <Route path="visualization" element={<Navigate to="/" replace />} />
               <Route path="visualization/:solutionId" element={<VisualizationPage />} />
               <Route path="packages" element={<PackagePage />} />
               <Route path="*" element={<Navigate to="/" replace />} />

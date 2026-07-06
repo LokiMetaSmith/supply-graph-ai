@@ -191,10 +191,12 @@ async def search_okw(
                             ),
                         }
                     ),
-                    "coordinates": {
-                        "latitude": getattr(facility.location, "latitude", None),
-                        "longitude": getattr(facility.location, "longitude", None),
-                    },
+                    "coordinates": (
+                        facility.location.coordinates().to_dict()
+                        if hasattr(facility.location, "coordinates")
+                        and facility.location.coordinates()
+                        else None
+                    ),
                 }
             )
 
@@ -391,6 +393,67 @@ async def get_okw_template(http_request: Request = None) -> Any:
     }
 
 
+@router.get(
+    "/spaces",
+    summary="Unified network surface (local OKW ∪ Maps of Making), server-filtered",
+    description="""
+    Return the unified network surface for the map + list views: local OKW
+    facilities unioned with Maps of Making (MoM) spaces, source-labeled and
+    projected to a common shape `{id, name, lat, lon, city, region, country,
+    source, status, processes, url}`.
+
+    Server-side filters:
+    - Cross-source (hard): `country`, `city`, `process` (canonical id), `source`
+      (`local`|`mom`), `status`.
+    - Local-only (soft): `region`, `access_type` — spaces that can't express the
+      axis (e.g. MoM) are kept, flagged `ambiguous`, and sorted last rather than
+      excluded.
+
+    Local facilities without coordinates are counted in `dropped_no_coords`. MoM
+    comes from a 24h TTL cache and degrades gracefully (`mom_available: false`).
+    `include_mom=false` returns local only; `force_refresh=true` refreshes MoM.
+    """,
+)
+async def get_okw_spaces(
+    include_mom: bool = True,
+    force_refresh: bool = False,
+    country: Optional[str] = Query(None),
+    city: Optional[str] = Query(None),
+    process: Optional[str] = Query(None, description="Canonical OHM process id"),
+    source: Optional[str] = Query(None, description='"local" or "mom"'),
+    status: Optional[str] = Query(None),
+    region: Optional[str] = Query(None),
+    access_type: Optional[str] = Query(None),
+    okw_service: OKWService = Depends(get_okw_service),
+) -> Any:
+    """Return the unified, server-filtered network surface (local OKW ∪ MoM)."""
+    try:
+        data = await okw_service.get_network_spaces(
+            include_mom=include_mom,
+            force_refresh=force_refresh,
+            country=country,
+            city=city,
+            process=process,
+            source=source,
+            status=status,
+            region=region,
+            access_type=access_type,
+        )
+        return {"success": True, **data}
+    except Exception as e:
+        error_response = create_error_response(
+            error=e,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            request_id=None,
+            suggestion="Please try again or contact support if the issue persists",
+        )
+        logger.error(f"Error building OKW network spaces: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_response.model_dump(mode="json"),
+        )
+
+
 @router.get("/{id}", response_model=OKWResponse)
 async def get_okw(
     id: UUID = Path(..., title="The ID of the OKW facility"),
@@ -560,10 +623,12 @@ async def list_okw(
                             ),
                         }
                     ),
-                    "coordinates": {
-                        "latitude": getattr(facility.location, "latitude", None),
-                        "longitude": getattr(facility.location, "longitude", None),
-                    },
+                    "coordinates": (
+                        facility.location.coordinates().to_dict()
+                        if hasattr(facility.location, "coordinates")
+                        and facility.location.coordinates()
+                        else None
+                    ),
                 }
             )
 

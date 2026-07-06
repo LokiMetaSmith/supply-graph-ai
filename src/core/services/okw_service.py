@@ -3,8 +3,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from ..domains.cooking.models import KitchenCapability
-from ..models.okw import ManufacturingFacility
+from ..models.okw import FacilityStatus, Location, ManufacturingFacility
 from ..storage.smart_discovery import SmartFileDiscovery
+from ..taxonomy import taxonomy
 from ..utils.logging import get_logger
 from ..validation.error_codes import VALIDATION_ERROR_CODE, VALIDATION_WARNING_CODE
 from ..validation.uuid_validator import UUIDValidator
@@ -12,6 +13,153 @@ from .base import BaseService, ServiceConfig
 from .storage_service import StorageService
 
 logger = get_logger(__name__)
+
+
+# --- Unified network-space projection + filtering (for GET /api/okw/spaces) ----
+
+# Status vocabularies differ by source (local: Active/Planned/…; MoM:
+# confirmed/seeded). Normalize to a small shared set for a coherent filter.
+_STATUS_NORMALIZED = {
+    "active": "active",
+    "confirmed": "active",
+    "planned": "tentative",
+    "seeded": "tentative",
+    "temporary closure": "tentative",
+    "closed": "inactive",
+    "inactive": "inactive",
+}
+
+
+def _normalize_status(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    key = value.strip().lower()
+    return _STATUS_NORMALIZED.get(key, key or None)
+
+
+def _canonical_processes(raw: List[str]) -> List[str]:
+    processes: List[str] = []
+    for p in raw or []:
+        cid = taxonomy.normalize(p)
+        if cid and cid not in processes:
+            processes.append(cid)
+    return processes
+
+
+def _local_facility_to_space(f: ManufacturingFacility) -> Optional[Dict[str, Any]]:
+    """Project a local facility to the unified network-space shape, or ``None``
+    when it has no plottable coordinates."""
+    coords = f.location.coordinates() if f.location else None
+    if coords is None:
+        return None
+    loc = f.location
+    addr = getattr(loc, "address", None)
+    owner = getattr(f, "owner", None)
+    return {
+        "id": str(f.id),
+        "name": f.name,
+        "lat": coords.latitude,
+        "lon": coords.longitude,
+        "city": getattr(addr, "city", None) or getattr(loc, "city", None),
+        "region": getattr(addr, "region", None) or getattr(loc, "region", None),
+        "country": getattr(addr, "country", None) or getattr(loc, "country", None),
+        "source": "local",
+        "status": _normalize_status(
+            f.facility_status.value if getattr(f, "facility_status", None) else None
+        ),
+        "processes": _canonical_processes(f.manufacturing_processes),
+        "access_type": f.access_type.value if getattr(f, "access_type", None) else None,
+        "url": getattr(owner, "website", None),
+    }
+
+
+def _mom_stub_facility(s: Dict[str, Any]) -> ManufacturingFacility:
+    """Build a matchable ManufacturingFacility stub from a cached MoM space.
+
+    MoM spaces have no equipment detail, so matching against them is process-level
+    (their canonical processes vs the design's requirements) — i.e. "spaces that
+    claim these processes, worth contacting".
+    """
+    return ManufacturingFacility(
+        name=s["name"],
+        location=Location(gps_coordinates=f"{s['lat']}, {s['lon']}"),
+        facility_status=FacilityStatus.ACTIVE,
+        manufacturing_processes=s.get("processes", []),
+    )
+
+
+def _mom_space_to_space(s: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a (cached, already-enriched) MoM space to the unified shape."""
+    return {
+        "id": s["space"],
+        "name": s["name"],
+        "lat": s["lat"],
+        "lon": s["lon"],
+        "city": s.get("city"),
+        "region": None,  # MoM has no sub-national region
+        "country": s.get("country"),
+        "source": "mom",
+        "status": _normalize_status(s.get("status")),
+        "processes": s.get("processes", []),
+        "access_type": None,  # MoM does not express access type
+        "url": s.get("url"),
+    }
+
+
+def _ci(value: Optional[str]) -> Optional[str]:
+    return value.strip().lower() if isinstance(value, str) else value
+
+
+def filter_network_spaces(
+    spaces: List[Dict[str, Any]],
+    *,
+    country: Optional[str] = None,
+    city: Optional[str] = None,
+    process: Optional[str] = None,
+    source: Optional[str] = None,
+    status: Optional[str] = None,
+    region: Optional[str] = None,
+    access_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Apply the network filters (pure).
+
+    Cross-source axes (country/city/process/source/status) hard-exclude
+    non-matches. Local-only axes (region/access_type) that a space *cannot*
+    express don't exclude it — the space is kept, flagged ``ambiguous``, and
+    sorted after the definite matches. A space that *can* express a local-only
+    axis but doesn't match is excluded.
+    """
+    kept: List[Dict[str, Any]] = []
+    for sp in spaces:
+        if source and sp.get("source") != source:
+            continue
+        if country and _ci(sp.get("country")) != _ci(country):
+            continue
+        if city and (not sp.get("city") or _ci(city) not in _ci(sp["city"])):
+            continue
+        if status and sp.get("status") != _ci(status):
+            continue
+        if process and process not in (sp.get("processes") or []):
+            continue
+
+        ambiguous = False
+        excluded = False
+        for axis, want in (("region", region), ("access_type", access_type)):
+            if not want:
+                continue
+            have = sp.get(axis)
+            if have is None:
+                ambiguous = True  # source can't express this axis
+            elif _ci(have) != _ci(want):
+                excluded = True
+                break
+        if excluded:
+            continue
+        kept.append({**sp, "ambiguous": ambiguous})
+
+    # Definite matches first, ambiguous last (stable within each group).
+    kept.sort(key=lambda s: s.get("ambiguous", False))
+    return kept
 
 
 class OKWService(BaseService["OKWService"]):
@@ -311,6 +459,129 @@ class OKWService(BaseService["OKWService"]):
             page=page, page_size=page_size, filter_params=filter_params
         )
         return facilities
+
+    async def get_network_spaces(
+        self,
+        *,
+        include_mom: bool = True,
+        force_refresh: bool = False,
+        country: Optional[str] = None,
+        city: Optional[str] = None,
+        process: Optional[str] = None,
+        source: Optional[str] = None,
+        status: Optional[str] = None,
+        region: Optional[str] = None,
+        access_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build the unified, server-filtered network surface: local OKW ∪ MoM.
+
+        Each space is source-labeled and projected to a common shape (city,
+        region, country, processes, status, url). Cross-source filters
+        (country/city/process/source/status) hard-exclude; local-only filters
+        (region/access_type) soft-filter — spaces that can't express the axis are
+        kept, flagged ``ambiguous``, and sorted last. Local facilities without
+        coordinates are counted (``dropped_no_coords``) rather than plotted. MoM
+        comes from a 24h TTL cache and degrades gracefully (``mom_available``).
+
+        Returns:
+            Dict with ``spaces`` (filtered/ranked), ``total``, per-source counts,
+            ``dropped_no_coords``, and ``mom_available``.
+        """
+        candidates, dropped_no_coords, mom_available = (
+            await self._load_network_candidates(
+                include_mom=include_mom, force_refresh=force_refresh
+            )
+        )
+        filtered = filter_network_spaces(
+            candidates,
+            country=country,
+            city=city,
+            process=process,
+            source=source,
+            status=status,
+            region=region,
+            access_type=access_type,
+        )
+        # Strip the internal facility back-reference from the browse payload.
+        spaces = [{k: v for k, v in sp.items() if k != "_facility"} for sp in filtered]
+        return {
+            "spaces": spaces,
+            "total": len(spaces),
+            "local_count": sum(1 for s in spaces if s["source"] == "local"),
+            "mom_count": sum(1 for s in spaces if s["source"] == "mom"),
+            "dropped_no_coords": dropped_no_coords,
+            "mom_available": mom_available,
+        }
+
+    async def _load_network_candidates(
+        self, *, include_mom: bool, force_refresh: bool
+    ) -> Tuple[List[Dict[str, Any]], int, bool]:
+        """Load local ∪ MoM as unified space dicts, each carrying its ``_facility``
+        (the matchable object) under a private key. Shared by the browse surface
+        and the network-match candidate pool so filtering stays identical.
+        """
+        candidates: List[Dict[str, Any]] = []
+        dropped_no_coords = 0
+        page = 1
+        page_size = 500
+        while True:
+            facilities, _ = await self.list(page=page, page_size=page_size)
+            if not facilities:
+                break
+            for f in facilities:
+                space = _local_facility_to_space(f)
+                if space is None:
+                    dropped_no_coords += 1
+                    continue
+                space["_facility"] = f
+                candidates.append(space)
+            if len(facilities) < page_size:
+                break
+            page += 1
+
+        mom_available = False
+        if include_mom:
+            from .mom_bridge import mom_spaces_cache
+
+            raw, mom_available = await mom_spaces_cache.get(force_refresh=force_refresh)
+            for s in raw:
+                space = _mom_space_to_space(s)
+                space["_facility"] = _mom_stub_facility(s)
+                candidates.append(space)
+
+        return candidates, dropped_no_coords, mom_available
+
+    async def get_network_match_facilities(
+        self,
+        *,
+        include_mom: bool = True,
+        force_refresh: bool = False,
+        country: Optional[str] = None,
+        city: Optional[str] = None,
+        process: Optional[str] = None,
+        source: Optional[str] = None,
+        status: Optional[str] = None,
+        region: Optional[str] = None,
+        access_type: Optional[str] = None,
+    ) -> List[ManufacturingFacility]:
+        """Return the filtered network as matchable facilities (local full objects
+        ∪ MoM process stubs), for matching a design against the same filtered set
+        the browse surface shows. Uses the identical filter as ``get_network_spaces``.
+        """
+        candidates, _, _ = await self._load_network_candidates(
+            include_mom=include_mom, force_refresh=force_refresh
+        )
+        filtered = filter_network_spaces(
+            candidates,
+            country=country,
+            city=city,
+            process=process,
+            source=source,
+            status=status,
+            region=region,
+            access_type=access_type,
+        )
+        return [sp["_facility"] for sp in filtered]
 
     async def list_kitchens(self) -> List[KitchenCapability]:
         """Return all kitchen capabilities found under the ``okw/`` prefix.
