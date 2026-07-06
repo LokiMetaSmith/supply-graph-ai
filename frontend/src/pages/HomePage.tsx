@@ -4,6 +4,7 @@ const steps = [
   { icon: "🔩", title: "Browse Designs", description: "Discover and inspect OKH hardware designs.", to: "/okh" },
   { icon: "⚡", title: "Run Match", description: "Match a design to manufacturing facilities.", to: "/match" },
   { icon: "🗺️", title: "Visualize", description: "Explore supply chain graphs and KPIs.", to: "/visualization" },
+  { icon: "📄", title: "Export RFQ", description: "Generate request-for-quote documents.", to: "/rfq" },
 ] as const;
 
 export function HomePage() {
@@ -14,7 +15,7 @@ export function HomePage() {
           Open Hardware Matchmaker
         </h1>
         <p className="mt-3 text-lg text-slate-500 dark:text-slate-400">
-          Discover designs · Match facilities · Visualize supply chains
+          Discover designs · Match facilities · Visualize supply chains · Export RFQs
         </p>
       </div>
 
